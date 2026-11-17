@@ -27,14 +27,7 @@ impl Event {
         output: impl Into<String>,
         source_ref: impl Into<String>,
     ) -> Self {
-        Event {
-            ts,
-            role: "tool".into(),
-            tool: name.into(),
-            text: input.into(),
-            output: output.into(),
-            source_ref: source_ref.into(),
-        }
+        Event { ts, role: "tool".into(), tool: name.into(), text: input.into(), output: output.into(), source_ref: source_ref.into() }
     }
 }
 

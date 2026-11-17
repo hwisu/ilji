@@ -9,6 +9,10 @@ layer. Agents query it over MCP. You can query it from the shell. Nothing leaves
 - **One index for four agents.** Codex (app database and `.jsonl` / `.jsonl.zst` rollouts),
   Claude Code (`~/.claude/projects`), OpenCode (`opencode*.db`, v1 and v2 tables, read directly)
   and pi (`~/.pi/agent/sessions`).
+- **Pull requests and CI, optional.** With the GitHub source on, pull requests (body, reviews,
+  comments, commits, changed files, failed checks with a log excerpt) and failed Actions runs of
+  the repositories you work in are kept in the same index, so an agent finds "why did CI fail on
+  that PR" in one search instead of a chain of `gh` calls.
 - **Keyword and meaning, Korean and English.** SQLite FTS5 (BM25) with Korean particle stripping
   and prefix matching, plus multilingual embeddings of the conversation, so a question asked in
   English finds a Korean discussion and the other way round. Each query is routed: lookups with
@@ -115,6 +119,12 @@ ilji --set search.hybrid=rrf search ...    # one run only
 | Setting | Default | What it does |
 |---|---|---|
 | `sources.{codex,claude,opencode,pi}` | on | which histories to read |
+| `sources.github` | off | pull requests and Actions runs through `gh` (the only source that uses the network) |
+| `github.repos` | ["auto"] | `owner/name` entries; `auto` adds the GitHub origins of clones your sessions ran in |
+| `github.interval_secs`, `github.max_calls` | 300, 300 | seconds between GitHub passes; API calls per pass (a first backfill spreads over passes) |
+| `github.comments`, `github.files`, `github.checks` | on, on, on | pull request comments and reviews, changed files, failed checks |
+| `github.runs` | failed | Actions runs outside pull requests: `all`, `failed` or `off` |
+| `github.logs`, `github.log_chars`, `github.log_context`, `github.logs_per_pr` | on, 16384, 10, 5 | failed job log excerpts: size, lines around each error, logs per pull request or run |
 | `index.days` | 90 | retention window; 0 keeps everything |
 | `index.tool_output` | full | index tool input and output, input only, or no tool calls |
 | `index.dialog_chunk`, `index.tool_window`, `index.tool_overlap` | 1024, 8192, 1024 | chunk resolution in characters |
@@ -137,7 +147,7 @@ ilji --set search.hybrid=rrf search ...    # one run only
 | `embed.query_prefix`, `embed.passage_prefix` | instruction, "" | text put before queries and passages |
 | `embed.precision` | i8 | `i8` (a quarter of the size) or `f32` |
 | `embed.batch`, `embed.max_chars`, `embed.min_chars` | 32, 2048, 20 | request size and text limits |
-| `embed.skip_imported_tools` | on | leave out tool transcripts Codex stores inside imported messages |
+| `embed.skip_imported_tools` | off | leave out tool transcripts Codex stores inside imported messages (halves embedding work; measured slightly worse on conversation questions) |
 | `serve.tools` | full | `full`: search, open, recent, files, fix; `compact`: one `ilji` tool with a mode |
 | `encrypt.mode` | none | reserved: `at-rest`, `he-vectors` |
 
@@ -173,6 +183,9 @@ your home directory with owner-only permissions. Masking is pattern-based and ca
 on localhost. Use full-disk encryption (LUKS, FileVault) on any machine that keeps agent history.
 Do not commit indexes or session files: this repository holds code only, and its tests build
 their inputs at run time.
+
+The GitHub source is off until you turn it on (`ilji sources enable github`). It calls the GitHub
+API read-only through your `gh` login, and what it fetches stays in the same local index.
 
 ## License
 

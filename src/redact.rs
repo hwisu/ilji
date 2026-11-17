@@ -42,15 +42,13 @@ static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// What precedes the name in arn:aws:secretsmanager:<region>:<account>:secret:<name>. That name is
 /// not the secret and agents search for it.
-static ARN_SECRET_HEAD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"arn:aws(?:-[a-z]+)*:secretsmanager:(?:[a-z0-9\-]+|\*):(?:\d{12}|\*):\z").unwrap()
-});
+static ARN_SECRET_HEAD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"arn:aws(?:-[a-z]+)*:secretsmanager:(?:[a-z0-9\-]+|\*):(?:\d{12}|\*):\z").unwrap());
 const ARN_SECRET_HEAD_MAX: usize = 80;
 
 static BEARER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(\b(?:authorization:\s*)?bearer\s+)([A-Za-z0-9._~+/\-]{16,}=*)").unwrap());
-static URL_CRED_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:)([^@\s/]{3,})(@)").unwrap());
+static URL_CRED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:)([^@\s/]{3,})(@)").unwrap());
 
 fn floor_boundary(s: &str, mut i: usize) -> usize {
     while i > 0 && !s.is_char_boundary(i) {
@@ -85,13 +83,12 @@ pub fn redact(text: &str) -> String {
     let t = URL_CRED_RE.replace_all(&t, |c: &Captures| format!("{}{MASK}{}", &c[1], &c[3]));
     let src = t.as_ref();
     ASSIGN_RE
-        .replace_all(src, |c: &Captures| {
-            if c[2].starts_with(MASK) || is_arn_secret_name(src, c) {
-                c[0].to_string()
-            } else {
-                format!("{}{MASK}", &c[1])
-            }
-        })
+        .replace_all(
+            src,
+            |c: &Captures| {
+                if c[2].starts_with(MASK) || is_arn_secret_name(src, c) { c[0].to_string() } else { format!("{}{MASK}", &c[1]) }
+            },
+        )
         .into_owned()
 }
 
@@ -101,10 +98,7 @@ pub fn find_secrets(text: &str) -> Vec<String> {
     hits.extend(BEARER_RE.captures_iter(text).filter(|c| &c[2] != MASK).map(|c| c[2].to_string()));
     hits.extend(URL_CRED_RE.captures_iter(text).filter(|c| &c[2] != MASK).map(|c| c[2].to_string()));
     hits.extend(
-        ASSIGN_RE
-            .captures_iter(text)
-            .filter(|c| !c[2].starts_with(MASK) && !is_arn_secret_name(text, c))
-            .map(|c| c[2].to_string()),
+        ASSIGN_RE.captures_iter(text).filter(|c| !c[2].starts_with(MASK) && !is_arn_secret_name(text, c)).map(|c| c[2].to_string()),
     );
     hits
 }

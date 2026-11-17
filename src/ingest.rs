@@ -73,7 +73,9 @@ pub fn run(store: &mut Store, cfg: &Config, only: &[String], full: bool, mut pro
             continue;
         }
         let mut sr = SourceReport { source: source.to_string(), ..Default::default() };
-        let candidates = match collect::scan(source, since) {
+        let known = |id: &str, sig: &str| !full && stored.get(id).is_some_and(|s| *s == format!("{fingerprint}:{sig}"));
+        let ctx = collect::ScanCtx { since, cfg, explicit: only.iter().any(|o| o == source), known: &known };
+        let candidates = match collect::scan(source, &ctx) {
             Ok(c) => c,
             Err(e) => {
                 report.errors.push(format!("{source}: {e:#}"));
@@ -103,10 +105,10 @@ pub fn run(store: &mut Store, cfg: &Config, only: &[String], full: bool, mut pro
                         let next = queue.lock().unwrap().next();
                         let Some((c, sig)) = next else { break };
                         let mut res = (c.load)();
-                        if let Ok(Some(s)) = res.as_mut() {
-                            if !prepare(s, cfg) {
-                                res = Ok(None);
-                            }
+                        if let Ok(Some(s)) = res.as_mut()
+                            && !prepare(s, cfg)
+                        {
+                            res = Ok(None);
                         }
                         if tx.send((c.id, sig, res)).is_err() {
                             break;

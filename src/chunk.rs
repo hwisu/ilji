@@ -10,7 +10,10 @@ use crate::model::Event;
 pub enum Body {
     Dialog(String),
     /// Character span into `tool_text(event)`.
-    Tool { start: usize, len: usize },
+    Tool {
+        start: usize,
+        len: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -23,10 +23,10 @@ fn newest(home: &Path, stem: &str) -> Option<PathBuf> {
     for entry in std::fs::read_dir(home).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(n) = name.strip_prefix(&format!("{stem}_")).and_then(|r| r.strip_suffix(".sqlite")) else { continue };
-        if let Ok(n) = n.parse::<u32>() {
-            if best.as_ref().is_none_or(|(b, _)| n > *b) {
-                best = Some((n, entry.path()));
-            }
+        if let Ok(n) = n.parse::<u32>()
+            && best.as_ref().is_none_or(|(b, _)| n > *b)
+        {
+            best = Some((n, entry.path()));
         }
     }
     best.map(|(_, p)| p)
@@ -94,8 +94,7 @@ pub fn scan(home: &Path, since: f64) -> anyhow::Result<Vec<Candidate>> {
     let mut sigs: HashMap<String, (i64, i64)> = HashMap::new();
     if let Some(h) = hist_db.as_ref() {
         let conn = open_ro(h)?;
-        let mut q =
-            conn.prepare("SELECT thread_id, count(*), max(updated_at_ordinal) FROM thread_items GROUP BY thread_id")?;
+        let mut q = conn.prepare("SELECT thread_id, count(*), max(updated_at_ordinal) FROM thread_items GROUP BY thread_id")?;
         for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)))? {
             let (id, n, last) = row?;
             sigs.insert(id, (n, last.unwrap_or(0)));
@@ -105,12 +104,12 @@ pub fn scan(home: &Path, since: f64) -> anyhow::Result<Vec<Candidate>> {
     let mut out = Vec::new();
     for t in threads {
         let id = format!("codex:{}", t.id);
-        if let (Some(h), Some(&(n, last))) = (hist_db.clone(), sigs.get(&t.id)) {
-            if n > 0 {
-                let signature = format!("db:{n}:{last}:{}", t.updated as i64);
-                out.push(Candidate { id, signature, load: Box::new(move || load_db(&t, &h, since)) });
-                continue;
-            }
+        if let (Some(h), Some(&(n, last))) = (hist_db.clone(), sigs.get(&t.id))
+            && n > 0
+        {
+            let signature = format!("db:{n}:{last}:{}", t.updated as i64);
+            out.push(Candidate { id, signature, load: Box::new(move || load_db(&t, &h, since)) });
+            continue;
         }
         let Some(path) = rollout(&t.rollout_path) else { continue };
         let meta = std::fs::metadata(&path)?;
@@ -208,10 +207,8 @@ pub fn item_event(d: &Value, ts: f64) -> Option<Event> {
         }
         "webSearch" => {
             let action = d.get("action").cloned().unwrap_or(Value::Null);
-            let query = [str_of(d, "query"), str_of(&action, "query"), str_of(&action, "url")]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or("");
+            let query =
+                [str_of(d, "query"), str_of(&action, "query"), str_of(&action, "url")].into_iter().find(|s| !s.is_empty()).unwrap_or("");
             let res: Vec<String> = d
                 .get("results")
                 .and_then(Value::as_array)
@@ -318,8 +315,7 @@ mod tests {
 
     #[test]
     fn maps_items() {
-        let e = item_event(&json!({"type": "commandExecution", "command": "ls", "aggregatedOutput": "x", "exitCode": 2}), 1.0)
-            .unwrap();
+        let e = item_event(&json!({"type": "commandExecution", "command": "ls", "aggregatedOutput": "x", "exitCode": 2}), 1.0).unwrap();
         assert_eq!((e.tool.as_str(), e.text.as_str(), e.output.as_str()), ("shell", "ls", "x\n[exit 2]"));
         let e = item_event(&json!({"type": "userMessage", "content": [{"type": "text", "text": "안녕"}]}), 1.0).unwrap();
         assert_eq!((e.role.as_str(), e.text.as_str()), ("user", "안녕"));

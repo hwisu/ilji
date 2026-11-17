@@ -63,9 +63,8 @@ pub fn key(ec: &EmbedCfg) -> String {
 }
 
 static IMPORTED: std::sync::LazyLock<[regex::Regex; 2]> = std::sync::LazyLock::new(|| {
-    ["call", "result"].map(|k| {
-        regex::Regex::new(&format!(r"(?s)\[external_agent_tool_{k}[^\]\n]*\].*?(?:\[/external_agent_tool_{k}\]|\z)")).unwrap()
-    })
+    ["call", "result"]
+        .map(|k| regex::Regex::new(&format!(r"(?s)\[external_agent_tool_{k}[^\]\n]*\].*?(?:\[/external_agent_tool_{k}\]|\z)")).unwrap())
 });
 
 /// Remove imported tool transcripts, including one cut off at the start of the chunk.
@@ -73,11 +72,11 @@ pub fn strip_imported_tools(text: &str) -> String {
     let mut t = text;
     let close = t.find("[/external_agent_tool_");
     let open = t.find("[external_agent_tool_");
-    if let Some(c) = close {
-        if open.is_none_or(|o| c < o) {
-            let end = t[c..].find(']').map_or(t.len(), |e| c + e + 1);
-            t = &t[end..];
-        }
+    if let Some(c) = close
+        && open.is_none_or(|o| c < o)
+    {
+        let end = t[c..].find(']').map_or(t.len(), |e| c + e + 1);
+        t = &t[end..];
     }
     let mut out = t.to_string();
     for re in IMPORTED.iter() {
@@ -148,7 +147,7 @@ impl Vectors {
                 v.i8s.extend(data.iter().map(|b| *b as i8));
             } else if data.len() == dim * 4 {
                 v.rows.push((1.0, false, v.f32s.len()));
-                v.f32s.extend(data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                v.f32s.extend(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
             } else {
                 continue;
             }
@@ -196,10 +195,11 @@ static CACHE: Mutex<Option<(String, i64, Arc<Vectors>)>> = Mutex::new(None);
 pub fn cached(store: &Store, model: &str) -> anyhow::Result<Arc<Vectors>> {
     let count: i64 = store.conn.query_row("SELECT count(*) FROM vectors WHERE model=?1", [model], |r| r.get(0))?;
     let mut guard = CACHE.lock().unwrap();
-    if let Some((m, c, v)) = guard.as_ref() {
-        if m == model && *c == count {
-            return Ok(v.clone());
-        }
+    if let Some((m, c, v)) = guard.as_ref()
+        && m == model
+        && *c == count
+    {
+        return Ok(v.clone());
     }
     let v = Arc::new(Vectors::load(store, model)?);
     *guard = Some((model.to_string(), count, v.clone()));
@@ -236,12 +236,7 @@ pub fn pending(store: &Store, cfg: &Config) -> anyhow::Result<Vec<(String, Strin
 }
 
 /// Embed what is pending, in batches of similar length. `progress(done, total, chars_per_sec)`.
-pub fn backfill(
-    store: &Store,
-    cfg: &Config,
-    limit: Option<usize>,
-    mut progress: impl FnMut(usize, usize, f64),
-) -> anyhow::Result<Report> {
+pub fn backfill(store: &Store, cfg: &Config, limit: Option<usize>, mut progress: impl FnMut(usize, usize, f64)) -> anyhow::Result<Report> {
     let ec = &cfg.embed;
     let mut todo = pending(store, cfg)?;
     if let Some(l) = limit {
@@ -296,8 +291,11 @@ mod tests {
         let s = strip_imported_tools(t);
         assert!(s.contains("I ran the tests.") && s.contains("All green."), "{s}");
         assert!(!s.contains("cargo test") && !s.contains("3 passed") && !s.contains("cut tail") && !s.contains("src/main.rs"), "{s}");
-        let ec = EmbedCfg::default();
-        assert!(passage_text(&ec, "[external_agent_tool_call: Bash]\nls\n[/external_agent_tool_call]").is_none());
+        let only_tools = "[external_agent_tool_call: Bash]\nls -la src\n[/external_agent_tool_call]";
+        let mut ec = EmbedCfg::default();
+        assert!(passage_text(&ec, only_tools).is_some(), "kept by default");
+        ec.skip_imported_tools = true;
+        assert!(passage_text(&ec, only_tools).is_none(), "nothing left once stripped");
     }
 
     #[test]

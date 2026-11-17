@@ -13,13 +13,11 @@ const SELF_SERVERS: &[&str] = &["ilji", "agent-history", "agent_history"];
 
 /// Search output, however it was produced (MCP, the CLI in a shell, an eval script).
 /// Indexing it would let the index quote itself.
-static SELF_OUTPUT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^(?:\d+ hits for |### chunk \d+ · |session \S+ · .* · started \d{4}-)").unwrap()
-});
+static SELF_OUTPUT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(?:\d+ hits for |### chunk \d+ · |session \S+ · .* · started \d{4}-)").unwrap());
 
 pub fn is_self_tool(name: &str) -> bool {
-    SELF_TOOL_PREFIXES.iter().any(|p| name.starts_with(p))
-        || SELF_SERVERS.contains(&name.split('.').next().unwrap_or(""))
+    SELF_TOOL_PREFIXES.iter().any(|p| name.starts_with(p)) || SELF_SERVERS.contains(&name.split('.').next().unwrap_or(""))
 }
 
 pub fn is_self_output(text: &str) -> bool {

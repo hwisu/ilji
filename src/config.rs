@@ -22,10 +22,11 @@ pub enum ToolOutput {
     Off,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Group {
     /// One entry per session with its best snippets (smaller answers).
+    #[default]
     Session,
     /// One entry per chunk.
     Chunk,
@@ -100,11 +101,14 @@ pub struct Sources {
     pub claude: bool,
     pub opencode: bool,
     pub pi: bool,
+    /// Pull requests and Actions runs through the `gh` CLI. Off by default: the only source that
+    /// uses the network.
+    pub github: bool,
 }
 
 impl Default for Sources {
     fn default() -> Self {
-        Sources { codex: true, claude: true, opencode: true, pi: true }
+        Sources { codex: true, claude: true, opencode: true, pi: true, github: false }
     }
 }
 
@@ -237,13 +241,14 @@ impl Default for EmbedCfg {
             auto: true,
             url: "http://127.0.0.1:8767/v1/embeddings".into(),
             model: "harrier-oss-v1-0.6b".into(),
-            query_prefix: "Instruct: Given a question about earlier coding work, retrieve the conversation passages that answer it\nQuery: ".into(),
+            query_prefix:
+                "Instruct: Given a question about earlier coding work, retrieve the conversation passages that answer it\nQuery: ".into(),
             passage_prefix: String::new(),
             precision: Precision::I8,
             batch: 32,
             max_chars: 2048,
             timeout_secs: 120,
-            skip_imported_tools: true,
+            skip_imported_tools: false,
             min_chars: 20,
         }
     }
@@ -260,6 +265,60 @@ pub struct ServeCfg {
 impl Default for ServeCfg {
     fn default() -> Self {
         ServeCfg { tools: Tools::Full, open_event_chars: 4000 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Runs {
+    /// Every Actions run outside pull requests (deploys, schedules, pushes).
+    All,
+    /// Only failed ones.
+    Failed,
+    Off,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubCfg {
+    /// "owner/name" entries; "auto" adds the GitHub origins of clones that sessions ran in.
+    pub repos: Vec<String>,
+    /// Seconds between GitHub passes of `watch` / `index` (`index --source github` always runs).
+    pub interval_secs: u64,
+    /// API calls one pass may make; the rest waits for the next pass.
+    pub max_calls: usize,
+    /// Pull request comments and reviews.
+    pub comments: bool,
+    /// Changed file list of a pull request (so `ilji files` finds pull requests).
+    pub files: bool,
+    /// Failed checks of a pull request's recent commits.
+    pub checks: bool,
+    /// Actions runs outside pull requests.
+    pub runs: Runs,
+    /// Fetch an excerpt of failed job logs.
+    pub logs: bool,
+    /// Characters kept per job log, and lines kept around each error line.
+    pub log_chars: usize,
+    pub log_context: usize,
+    /// Failed job logs fetched per pull request or run.
+    pub logs_per_pr: usize,
+}
+
+impl Default for GithubCfg {
+    fn default() -> Self {
+        GithubCfg {
+            repos: vec!["auto".into()],
+            interval_secs: 300,
+            max_calls: 300,
+            comments: true,
+            files: true,
+            checks: true,
+            runs: Runs::Failed,
+            logs: true,
+            log_chars: 16384,
+            log_context: 10,
+            logs_per_pr: 5,
+        }
     }
 }
 
@@ -284,6 +343,7 @@ pub struct Config {
     pub embed: EmbedCfg,
     pub serve: ServeCfg,
     pub encrypt: EncryptCfg,
+    pub github: GithubCfg,
 }
 
 impl Config {
@@ -323,6 +383,9 @@ impl Config {
         if i.tool_overlap >= i.tool_window {
             bail!("index.tool_overlap must be smaller than index.tool_window");
         }
+        if self.github.max_calls < 5 || self.github.log_chars < 500 {
+            bail!("github.max_calls must be ≥ 5 and github.log_chars ≥ 500");
+        }
         if self.search.k == 0 || self.search.snippet < 40 {
             bail!("search.k must be ≥ 1 and search.snippet ≥ 40");
         }
@@ -347,6 +410,7 @@ impl Config {
             "claude" => self.sources.claude,
             "opencode" => self.sources.opencode,
             "pi" => self.sources.pi,
+            "github" => self.sources.github,
             _ => false,
         }
     }
@@ -376,9 +440,7 @@ pub fn lookup<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> 
 pub fn set_path(root: &mut toml::Value, path: &str, raw: &str) -> anyhow::Result<()> {
     let Some((section, key)) = path.split_once('.') else { bail!("use section.key, e.g. search.k") };
     let defaults = toml::Value::try_from(Config::default())?;
-    let Some(template) = lookup(&defaults, path) else {
-        bail!("unknown setting {path:?}; see `ilji config list`")
-    };
+    let Some(template) = lookup(&defaults, path) else { bail!("unknown setting {path:?}; see `ilji config list`") };
     let value = match template {
         toml::Value::Boolean(_) => toml::Value::Boolean(match raw.to_lowercase().as_str() {
             "true" | "on" | "yes" | "1" => true,
@@ -387,9 +449,9 @@ pub fn set_path(root: &mut toml::Value, path: &str, raw: &str) -> anyhow::Result
         }),
         toml::Value::Integer(_) => toml::Value::Integer(raw.parse().with_context(|| format!("{path} wants an integer"))?),
         toml::Value::Float(_) => toml::Value::Float(raw.parse().with_context(|| format!("{path} wants a number"))?),
-        toml::Value::Array(_) => toml::Value::Array(
-            raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| toml::Value::String(s.into())).collect(),
-        ),
+        toml::Value::Array(_) => {
+            toml::Value::Array(raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| toml::Value::String(s.into())).collect())
+        }
         _ => toml::Value::String(raw.to_string()),
     };
     let table = root.as_table_mut().context("config root")?;
@@ -407,9 +469,8 @@ pub fn home() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    env_path("ILJI_CONFIG").unwrap_or_else(|| {
-        env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("ilji/config.toml")
-    })
+    env_path("ILJI_CONFIG")
+        .unwrap_or_else(|| env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("ilji/config.toml"))
 }
 
 pub fn data_dir() -> PathBuf {
@@ -430,9 +491,7 @@ pub fn claude_projects() -> PathBuf {
 }
 
 pub fn opencode_home() -> PathBuf {
-    env_path("OPENCODE_DATA").unwrap_or_else(|| {
-        env_path("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local/share")).join("opencode")
-    })
+    env_path("OPENCODE_DATA").unwrap_or_else(|| env_path("XDG_DATA_HOME").unwrap_or_else(|| home().join(".local/share")).join("opencode"))
 }
 
 pub fn now() -> f64 {

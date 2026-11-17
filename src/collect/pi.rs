@@ -101,7 +101,13 @@ pub fn load(path: &Path, native_id: &str, since: f64) -> anyhow::Result<Option<S
                                 continue;
                             }
                             calls.insert(str_of(b, "id").to_string(), events.len());
-                            events.push(Event::tool(ts, tool, tool_input(b.get("arguments").unwrap_or(&Value::Null)), "", source_ref.clone()));
+                            events.push(Event::tool(
+                                ts,
+                                tool,
+                                tool_input(b.get("arguments").unwrap_or(&Value::Null)),
+                                "",
+                                source_ref.clone(),
+                            ));
                         }
                         _ => {}
                     }

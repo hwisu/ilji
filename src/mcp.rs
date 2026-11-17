@@ -14,7 +14,10 @@ use crate::search::{self, OpenArgs, Query};
 use crate::store::Store;
 
 const INSTRUCTIONS: &str = "ilji searches this machine's past Codex, Claude Code, OpenCode and pi sessions \
-(raw conversation turns and tool runs, secrets masked). Activity from the last few minutes is left out.
+(raw conversation turns and tool runs, secrets masked). Activity from the last few minutes is left out. \
+When the GitHub source is on, pull requests (body, reviews, failed checks with log excerpts) and failed \
+Actions runs are in it too (source \"github\", ids like github:owner/repo#123); look there before calling gh, \
+and use gh only for live status, since the copy is as of the last sync.
 
 When to use
 - The user refers to earlier work: \"예전에\", \"지난번\", \"그때\", \"우리가 ~했던\", \"previously\", \"last time\".
@@ -32,7 +35,7 @@ pub struct SearchArgs {
     pub query: String,
     /// Number of sessions (or chunks with group=chunk) to return.
     pub k: Option<usize>,
-    /// codex | claude | opencode | pi
+    /// codex | claude | opencode | pi | github
     pub source: Option<String>,
     /// Substring of the repo name or working directory.
     pub repo: Option<String>,
@@ -270,8 +273,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             server.waiting().await?;
         }
         Tools::Compact => {
-            let server =
-                CompactServer { core, tool_router: CompactServer::tool_router() }.serve(rmcp::transport::stdio()).await?;
+            let server = CompactServer { core, tool_router: CompactServer::tool_router() }.serve(rmcp::transport::stdio()).await?;
             server.waiting().await?;
         }
     }

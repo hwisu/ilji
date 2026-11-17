@@ -33,9 +33,7 @@ pub fn export(db: &Path, out: &Path, with_vectors: bool, force: bool) -> anyhow:
         std::fs::remove_file(out)?;
     }
     let src = Store::open_ro(db)?;
-    src.conn
-        .execute("VACUUM INTO ?1", [out.to_string_lossy()])
-        .with_context(|| format!("writing {}", out.display()))?;
+    src.conn.execute("VACUUM INTO ?1", [out.to_string_lossy()]).with_context(|| format!("writing {}", out.display()))?;
     drop(src);
     private(out);
     let dst = Connection::open(out)?;
@@ -76,8 +74,7 @@ pub fn import(db: &Path, file: &Path, cfg: &Config) -> anyhow::Result<Imported> 
     }
     let src = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_context(|| format!("opening {}", file.display()))?;
-    let schema: Option<String> =
-        src.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional().unwrap_or(None);
+    let schema: Option<String> = src.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional().unwrap_or(None);
     if schema.as_deref() != Some(SCHEMA_VERSION) {
         bail!(
             "{} has index schema {}, this ilji uses {SCHEMA_VERSION}; export it again with the same ilji version",
@@ -146,12 +143,8 @@ pub fn import(db: &Path, file: &Path, cfg: &Config) -> anyhow::Result<Imported> 
         r.sessions += 1;
     }
 
-    let wanted: HashSet<String> = store
-        .conn
-        .prepare("SELECT DISTINCT hash FROM chunks WHERE hash IS NOT NULL")?
-        .query_map([], |x| x.get(0))?
-        .flatten()
-        .collect();
+    let wanted: HashSet<String> =
+        store.conn.prepare("SELECT DISTINCT hash FROM chunks WHERE hash IS NOT NULL")?.query_map([], |x| x.get(0))?.flatten().collect();
     let tx = store.conn.transaction()?;
     {
         let mut ins = tx.prepare("INSERT OR IGNORE INTO vectors(model, hash, dim, scale, data) VALUES(?1, ?2, ?3, ?4, ?5)")?;
@@ -160,7 +153,8 @@ pub fn import(db: &Path, file: &Path, cfg: &Config) -> anyhow::Result<Imported> 
         while let Some(x) = rows.next()? {
             let hash: String = x.get(1)?;
             if wanted.contains(&hash) {
-                r.vectors += ins.execute(params![x.get::<_, String>(0)?, hash, x.get::<_, i64>(2)?, x.get::<_, f64>(3)?, x.get::<_, Vec<u8>>(4)?])?;
+                r.vectors +=
+                    ins.execute(params![x.get::<_, String>(0)?, hash, x.get::<_, i64>(2)?, x.get::<_, f64>(3)?, x.get::<_, Vec<u8>>(4)?])?;
             }
         }
     }
@@ -183,8 +177,8 @@ fn private(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed;
     use crate::config::Precision;
+    use crate::embed;
 
     fn session(id: &str, ts: f64) -> Session {
         Session {

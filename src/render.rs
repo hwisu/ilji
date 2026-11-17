@@ -16,8 +16,7 @@ pub fn results(r: &Results, group: Group, max_chars: usize) -> String {
     if r.sessions.is_empty() {
         return out + "\nNo hits. Try other words, a cue from the work (file, error, PR), or include_recent.\n";
     }
-    let mut shown = 0;
-    for s in &r.sessions {
+    for (shown, s) in r.sessions.iter().enumerate() {
         let mut block = String::new();
         match group {
             Group::Session => {
@@ -30,7 +29,8 @@ pub fn results(r: &Results, group: Group, max_chars: usize) -> String {
                     s.repo
                 );
                 for h in &s.hits {
-                    block += &format!("### chunk {} · {} · {} · score {:.2}\n{}\n", h.chunk, h.kind, fmt_time(h.ts, false), h.score, h.snippet);
+                    block +=
+                        &format!("### chunk {} · {} · {} · score {:.2}\n{}\n", h.chunk, h.kind, fmt_time(h.ts, false), h.score, h.snippet);
                 }
             }
             Group::Chunk => {
@@ -49,11 +49,13 @@ pub fn results(r: &Results, group: Group, max_chars: usize) -> String {
             }
         }
         if out.chars().count() + block.chars().count() > max_chars && shown > 0 {
-            out += &format!("\n[{} more results cut at {max_chars} characters; narrow the query or raise max_chars]\n", r.sessions.len() - shown);
+            out += &format!(
+                "\n[{} more results cut at {max_chars} characters; narrow the query or raise max_chars]\n",
+                r.sessions.len() - shown
+            );
             break;
         }
         out += &block;
-        shown += 1;
     }
     out + "\nRead more with open <chunk id>, e<event id> or a session id.\n"
 }
@@ -80,9 +82,15 @@ pub fn fix(error: &str, rows: &[FixRow]) -> String {
     }
     let mut out = format!("After '{}' in {} sessions:\n", one_line(error, 80), rows.len());
     for r in rows {
-        out += &format!("\n## {} · {} · {} (error in chunk {})\n", r.session, fmt_time(r.when, true), one_line(&r.title, 80), r.error_chunk);
+        out +=
+            &format!("\n## {} · {} · {} (error in chunk {})\n", r.session, fmt_time(r.when, true), one_line(&r.title, 80), r.error_chunk);
         for (i, (ev, tool, input, status)) in r.after.iter().enumerate() {
-            out += &format!("{}. [e{ev}] {tool}: {}{}\n", i + 1, one_line(input, 200), if status.is_empty() { String::new() } else { format!("  {status}") });
+            out += &format!(
+                "{}. [e{ev}] {tool}: {}{}\n",
+                i + 1,
+                one_line(input, 200),
+                if status.is_empty() { String::new() } else { format!("  {status}") }
+            );
         }
     }
     out

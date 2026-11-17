@@ -28,12 +28,6 @@ pub struct Query {
     pub raw_match: Option<String>,
 }
 
-impl Default for Group {
-    fn default() -> Self {
-        Group::Session
-    }
-}
-
 impl Query {
     pub fn new(text: &str, cfg: &Config) -> Query {
         let s = &cfg.search;
@@ -89,11 +83,7 @@ pub struct Results {
 pub fn search(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Results> {
     let s = &cfg.search;
     let lexical = s.mode == Mode::Hybrid && s.hybrid == Hybrid::Auto && is_lexical(&q.text);
-    let want_dense = cfg.embed.enabled
-        && s.mode != Mode::Keyword
-        && !lexical
-        && q.raw_match.is_none()
-        && q.kind.as_deref() != Some("tool");
+    let want_dense = cfg.embed.enabled && s.mode != Mode::Keyword && !lexical && q.raw_match.is_none() && q.kind.as_deref() != Some("tool");
     let mut note = None;
     let dense = if want_dense {
         match dense_lane(store, cfg, q) {
@@ -202,8 +192,7 @@ fn dense_lane(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Vec<Hit>
     if top.is_empty() {
         return Ok(vec![]);
     }
-    let rank: HashMap<&str, (usize, f32)> =
-        top.iter().enumerate().map(|(r, (i, s))| (vecs.hashes[*i].as_str(), (r, *s))).collect();
+    let rank: HashMap<&str, (usize, f32)> = top.iter().enumerate().map(|(r, (i, s))| (vecs.hashes[*i].as_str(), (r, *s))).collect();
     let n = top.len();
     let marks = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let sql = format!(
@@ -307,9 +296,8 @@ fn fetch_lane(store: &Store, cfg: &Config, q: &Query, expr: &str, kind: Option<&
            AND c.ts < ?5 AND c.ts >= ?6
          ORDER BY bm25(chunks_fts, 1.0, ?8) LIMIT ?7",
     )?;
-    let rows = st.query_map(
-        params![expr, q.source, q.repo, kind, until, q.since.unwrap_or(0.0), n as i64, cfg.search.title_weight],
-        |r| {
+    let rows =
+        st.query_map(params![expr, q.source, q.repo, kind, until, q.since.unwrap_or(0.0), n as i64, cfg.search.title_weight], |r| {
             let kind: String = r.get(6)?;
             let text = if kind == "tool" {
                 let full = tool_text(
@@ -335,8 +323,7 @@ fn fetch_lane(store: &Store, cfg: &Config, q: &Query, expr: &str, kind: Option<&
                 text,
                 snippet: String::new(),
             })
-        },
-    )?;
+        })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -381,11 +368,7 @@ fn finish(store: &Store, cfg: &Config, q: &Query, ranked: Vec<Hit>) -> anyhow::R
         let ids: Vec<&String> = order.iter().filter_map(|k| groups.get(k).and_then(|g| g.first()).map(|h| &h.session)).collect();
         let mut m = HashMap::new();
         for id in ids {
-            if let Some(t) = store
-                .conn
-                .query_row("SELECT started_at FROM sessions WHERE id=?1", [id], |r| r.get::<_, f64>(0))
-                .optional()?
-            {
+            if let Some(t) = store.conn.query_row("SELECT started_at FROM sessions WHERE id=?1", [id], |r| r.get::<_, f64>(0)).optional()? {
                 m.insert(id.clone(), t);
             }
         }
@@ -423,12 +406,7 @@ pub fn snippet(text: &str, terms: &[String], size: usize) -> String {
         return text.to_string();
     }
     let lower = text.to_lowercase();
-    let pos = terms
-        .iter()
-        .filter_map(|t| lower.find(t.as_str()))
-        .min()
-        .map(|b| lower[..b].chars().count())
-        .unwrap_or(0);
+    let pos = terms.iter().filter_map(|t| lower.find(t.as_str())).min().map(|b| lower[..b].chars().count()).unwrap_or(0);
     let start = pos.saturating_sub(size / 4).min(n - size);
     let body = char_slice(text, start, size);
     format!("{}{}{}", if start > 0 { "…" } else { "" }, body, if start + size < n { "…" } else { "" })
@@ -475,10 +453,7 @@ pub fn open(store: &Store, a: &OpenArgs) -> anyhow::Result<String> {
         [&session],
         |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)),
     )?;
-    let mut out = format!(
-        "session {session} · {source} · {title} · {repo} · started {} · {total} events\n",
-        fmt_time(started, true)
-    );
+    let mut out = format!("session {session} · {source} · {title} · {repo} · started {} · {total} events\n", fmt_time(started, true));
     let mut q = store.conn.prepare(
         "SELECT id, seq, ts, role, coalesce(tool,''), coalesce(text,''), coalesce(output,''), coalesce(source_ref,'')
          FROM events WHERE session_id=?1 AND id >= ?2 AND id <= ?3 ORDER BY id",
@@ -508,7 +483,11 @@ pub fn open(store: &Store, a: &OpenArgs) -> anyhow::Result<String> {
             piece += &format!("\n…[{} more characters; open e{id} with offset {}]", n - start - take, start + take);
         }
         let marker = if id >= first && id <= last { "▶ " } else { "" };
-        out += &format!("\n{marker}[e{id} #{seq}] {} {role}{}\n{piece}\n", fmt_time(ts, false), if tool.is_empty() { String::new() } else { format!(" {tool}") });
+        out += &format!(
+            "\n{marker}[e{id} #{seq}] {} {role}{}\n{piece}\n",
+            fmt_time(ts, false),
+            if tool.is_empty() { String::new() } else { format!(" {tool}") }
+        );
         if !sref.is_empty() && id >= first && id <= last {
             out += &format!("(source: {sref})\n");
         }
@@ -594,12 +573,7 @@ pub fn fix(store: &Store, cfg: &Config, error: &str, n: usize, steps: usize) -> 
         let after = st
             .query_map(params![s.session, h.event, steps as i64], |r| {
                 let output: String = r.get(3)?;
-                let status = output
-                    .lines()
-                    .rev()
-                    .find(|l| l.starts_with("[exit") || l.starts_with("[error]"))
-                    .unwrap_or("")
-                    .to_string();
+                let status = output.lines().rev().find(|l| l.starts_with("[exit") || l.starts_with("[error]")).unwrap_or("").to_string();
                 Ok((r.get(0)?, r.get(1)?, crate::common::head_chars(&r.get::<_, String>(2)?, 300).to_string(), status))
             })?
             .flatten()

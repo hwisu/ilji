@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::chunk::{Body, chunk_events, char_slice, tool_text};
+use crate::chunk::{Body, char_slice, chunk_events, tool_text};
 use crate::config::IndexCfg;
 use crate::model::Session;
 
@@ -78,10 +78,8 @@ impl Store {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         // The index is a cache of the source stores: on a schema change it is rebuilt, not migrated.
-        let version: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0))
-            .optional()
-            .unwrap_or(None);
+        let version: Option<String> =
+            conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional().unwrap_or(None);
         if version.as_deref() != Some(SCHEMA_VERSION) {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS events;
@@ -186,7 +184,17 @@ impl Store {
                             cached = Some((c.first, tool_text(&e.tool, &e.text, &e.output)));
                         }
                         let body = char_slice(&cached.as_ref().unwrap().1, *start, *len);
-                        ins_chunk.execute(params![s.id, first, last, c.ts, "tool", None::<String>, *start as i64, *len as i64, None::<String>])?;
+                        ins_chunk.execute(params![
+                            s.id,
+                            first,
+                            last,
+                            c.ts,
+                            "tool",
+                            None::<String>,
+                            *start as i64,
+                            *len as i64,
+                            None::<String>
+                        ])?;
                         ins_fts.execute(params![tx.last_insert_rowid(), body, s.title])?;
                     }
                 }
@@ -210,9 +218,7 @@ impl Store {
 
     /// Drop vectors no chunk refers to any more. Returns how many went.
     pub fn prune_vectors(&self) -> anyhow::Result<usize> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM vectors WHERE hash NOT IN (SELECT hash FROM chunks WHERE hash IS NOT NULL)", [])?)
+        Ok(self.conn.execute("DELETE FROM vectors WHERE hash NOT IN (SELECT hash FROM chunks WHERE hash IS NOT NULL)", [])?)
     }
 
     /// Sessions whose id, cwd or repo contains one of `patterns`.
@@ -238,14 +244,12 @@ impl Store {
              FROM sessions s GROUP BY s.source ORDER BY s.source",
         )?;
         st.sources = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.flatten().collect();
-        (st.first, st.last) = self.conn.query_row(
-            "SELECT coalesce(min(started_at), 0), coalesce(max(updated_at), 0) FROM sessions",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        (st.first, st.last) =
+            self.conn.query_row("SELECT coalesce(min(started_at), 0), coalesce(max(updated_at), 0) FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
         st.forgotten = self.conn.query_row("SELECT count(*) FROM forgotten", [], |r| r.get(0))?;
-        st.dialog_chunks =
-            self.conn.query_row("SELECT count(DISTINCT hash) FROM chunks WHERE kind='dialog'", [], |r| r.get(0))?;
+        st.dialog_chunks = self.conn.query_row("SELECT count(DISTINCT hash) FROM chunks WHERE kind='dialog'", [], |r| r.get(0))?;
         let mut q = self.conn.prepare(
             "SELECT v.model, count(*), (SELECT count(DISTINCT c.hash) FROM chunks c JOIN vectors w
                                         ON w.hash = c.hash AND w.model = v.model WHERE c.kind = 'dialog')
