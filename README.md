@@ -42,32 +42,26 @@ A keyword search takes under 10 ms, a hybrid one about 120 ms.
 ## Install
 
 ```sh
-cargo install --git https://github.com/hwisu/ilji
-ilji index                      # first pass over the last 90 days
+cargo install --git https://github.com/hwisu/ilji   # or from a checkout: cargo install --path .
+ilji setup all                  # shows every step below
+ilji setup all --apply          # does them
 ```
 
-or from a checkout: `cargo build --release` and use `target/release/ilji`.
+`setup all --apply` does, in order:
 
-For meaning-based search, run one embedding server and fill the vectors:
+1. **Embedding server.** Finds `llama-server` and the model, or downloads the pinned ones
+   (Linux x86-64, Vulkan; ~700 MB) and checks their SHA-256, then installs a systemd user
+   service or launchd agent. If something already answers on the embedding port it does not
+   start a second server: two on a shared iGPU can exhaust the memory the desktop also uses.
+2. **Indexer.** Installs `ilji watch` as a service. Its first pass indexes the last 90 days,
+   then embeds the conversation; later passes pick up only what changed.
+3. **Agents.** Registers `ilji serve` through each agent's own `mcp add` (Claude Code, Codex,
+   OpenCode, pi), replacing an older entry, and skips agents that are not installed.
 
-```sh
-ilji setup embed-server         # finds llama-server and the model, or prints how to get them
-ilji setup embed-server --apply # installs it as a systemd user service / launchd agent
-ilji embed                      # first backfill; later `index` and `watch` embed new chunks
-```
-
-Run a single embedding server for all agents: on a shared iGPU a second one can exhaust the
-memory the desktop also uses. Without a server, ilji answers with keyword search and says so.
-
-Connect your agents. `setup` prints what to add; with `--apply` it registers through the
-agent's own CLI where there is one (Claude Code, pi):
-
-```sh
-ilji setup                      # snippets for claude, codex, opencode and pi
-ilji setup claude --apply       # claude mcp add --scope user ilji -- ilji serve
-ilji setup pi --apply           # pi mcp add ilji -- ilji serve
-ilji setup service --apply      # `ilji watch` as a systemd user service or launchd agent
-```
+Each step also runs alone: `ilji setup embed-server|service|claude|codex|opencode|pi [--apply]`.
+`--tools compact` registers a single `ilji` tool instead of five. Without an embedding server,
+ilji answers with keyword search and says so; `ilji index` and `ilji embed` run the indexer
+by hand.
 
 `ilji serve` is read-only; `ilji watch` (or a scheduled `ilji index`) is the only writer.
 
