@@ -54,14 +54,15 @@ pub fn prepare(s: &mut Session, cfg: &Config) -> bool {
     !s.events.is_empty()
 }
 
-fn excluded(s: &Session, patterns: &[String]) -> bool {
+pub fn excluded(s: &Session, patterns: &[String]) -> bool {
     patterns.iter().any(|p| s.id.contains(p.as_str()) || s.cwd.contains(p.as_str()) || s.repo.contains(p.as_str()))
 }
 
 /// Index every enabled source (or only `only`). With `full`, sessions are written even when unchanged.
 pub fn run(store: &mut Store, cfg: &Config, only: &[String], full: bool, mut progress: impl FnMut(&str)) -> anyhow::Result<Report> {
     let t0 = Instant::now();
-    let since = now() - cfg.index.days * 86400.0;
+    // index.days = 0 keeps everything.
+    let since = if cfg.index.days > 0.0 { now() - cfg.index.days * 86400.0 } else { 0.0 };
     let fingerprint = cfg.index_fingerprint();
     let stored = store.signatures()?;
     let mut report = Report::default();

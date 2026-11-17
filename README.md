@@ -82,6 +82,22 @@ ilji exclude add secret-project     # skip a project by path, repo or id
 
 Most commands take `--json`.
 
+### Move or back up
+
+The index is one SQLite file, vectors included. Vectors are stored little-endian and keyed by
+model and chunk text, so a file made on Linux works on macOS and the other way round.
+
+```sh
+ilji export ~/ilji-2026-11.db          # consistent single-file snapshot, owner-only, ~1 s
+ilji --db ~/ilji-2026-11.db search ...  # search a copy in place
+ilji import ~/ilji-2026-11.db          # merge it into this machine's index
+```
+
+`import` adds the sessions this index lacks or holds older copies of, brings their vectors
+along, and carries forget decisions over. This machine's settings apply on the way in:
+retention, exclusions, masking and chunk sizes; chunks cut differently here are embedded again.
+`--no-vectors` makes a smaller export. Set `index.days = 0` to keep imported history of any age.
+
 ## Configure
 
 Settings live in `~/.config/ilji/config.toml`. Later layers win: defaults, the file,
@@ -99,7 +115,7 @@ ilji --set search.hybrid=rrf search ...    # one run only
 | Setting | Default | What it does |
 |---|---|---|
 | `sources.{codex,claude,opencode,pi}` | on | which histories to read |
-| `index.days` | 90 | retention window |
+| `index.days` | 90 | retention window; 0 keeps everything |
 | `index.tool_output` | full | index tool input and output, input only, or no tool calls |
 | `index.dialog_chunk`, `index.tool_window`, `index.tool_overlap` | 1024, 8192, 1024 | chunk resolution in characters |
 | `index.max_output` | 262144 | characters of one tool output that are stored |
@@ -128,7 +144,8 @@ ilji --set search.hybrid=rrf search ...    # one run only
 Vectors are stored per model and per embedding setting, so changing the model or a prefix
 re-embeds instead of mixing vectors; `ilji embed --drop <key>` removes an old set.
 
-Paths: the index is in `~/.local/share/ilji` (`ILJI_HOME` or `--home`). Sources follow
+Paths: the index is `~/.local/share/ilji/index.db` (`ILJI_HOME` or `--home` for the directory,
+`ILJI_DB` or `--db` for the file). Sources follow
 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `OPENCODE_DATA` / `XDG_DATA_HOME`, `PI_CODING_AGENT_DIR` and
 `PI_CODING_AGENT_SESSION_DIR`.
 

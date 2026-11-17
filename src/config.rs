@@ -416,8 +416,9 @@ pub fn data_dir() -> PathBuf {
     env_path("ILJI_HOME").unwrap_or_else(|| home().join(".local/share/ilji"))
 }
 
+/// The index file: ILJI_DB, or index.db in the data directory.
 pub fn db_path() -> PathBuf {
-    data_dir().join("index.db")
+    env_path("ILJI_DB").unwrap_or_else(|| data_dir().join("index.db"))
 }
 
 pub fn codex_home() -> PathBuf {

@@ -11,7 +11,7 @@ use crate::chunk::{Body, chunk_events, char_slice, tool_text};
 use crate::config::IndexCfg;
 use crate::model::Session;
 
-const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "3";
 
 /// FNV-1a 64-bit: stable across builds, used to key vectors by chunk text.
 pub fn text_hash(s: &str) -> String {

@@ -8,6 +8,7 @@ mod embed;
 mod ingest;
 mod mcp;
 mod model;
+mod portable;
 mod redact;
 mod render;
 mod search;
@@ -31,6 +32,9 @@ struct Cli {
     /// Data directory (default ~/.local/share/ilji; also ILJI_HOME).
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
+    /// Index file to use instead of <home>/index.db, e.g. an exported copy (also ILJI_DB).
+    #[arg(long, global = true, value_name = "FILE")]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -142,6 +146,22 @@ enum Cmd {
     VerifyRedaction,
     /// Give space freed by deleted or rewritten sessions back to the disk.
     Vacuum,
+    /// Write the whole index, vectors included, to one SQLite file: a backup, or a copy for
+    /// another machine. The file works the same on Linux and macOS; search it in place with
+    /// `ilji --db FILE search ...` or merge it into another index with `ilji import FILE`.
+    Export {
+        file: PathBuf,
+        /// Leave the vectors out (smaller; the other side embeds again).
+        #[arg(long)]
+        no_vectors: bool,
+        /// Overwrite FILE if it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Merge an exported file into this index: sessions it lacks or holds older copies of, their
+    /// vectors, and forget decisions. This machine's settings apply (retention, exclusions,
+    /// masking, chunk sizes); then new chunks are embedded as after `index`.
+    Import { file: PathBuf },
     /// Connect agents, run `watch` as a service, or install the embedding server; prints what it
     /// would do, and does it with --apply. `ilji setup all --apply` does everything at once.
     Setup {
@@ -256,6 +276,10 @@ fn run() -> anyhow::Result<()> {
     if let Some(h) = &cli.home {
         // SAFETY: set before any other thread starts.
         unsafe { std::env::set_var("ILJI_HOME", h) };
+    }
+    if let Some(d) = &cli.db {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("ILJI_DB", d) };
     }
     let mut cfg = Config::load(&cli.set)?;
     let db = db_path();
@@ -479,6 +503,25 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Setup { target, apply, tools } => setup(target.as_deref(), apply, tools)?,
+        Cmd::Export { file, no_vectors, force } => {
+            let e = portable::export(&db, &file, !no_vectors, force)?;
+            println!("wrote {}: {} sessions, {} vectors, {:.1} MB", file.display(), e.sessions, e.vectors, e.bytes as f64 / 1e6);
+        }
+        Cmd::Import { file } => {
+            let r = portable::import(&db, &file, &cfg)?;
+            println!(
+                "imported {} sessions ({} chunks, {} vectors); kept {} that are as new here",
+                r.sessions, r.chunks, r.vectors, r.kept
+            );
+            let skipped = [(r.old, "older than index.days"), (r.excluded, "excluded"), (r.forgotten, "forgotten here")];
+            for (n, why) in skipped.iter().filter(|(n, _)| *n > 0) {
+                println!("skipped {n} {why}");
+            }
+            if r.forgets > 0 {
+                println!("carried over {} forget decisions", r.forgets);
+            }
+            auto_embed(&Store::open(&db)?, &cfg, false);
+        }
         Cmd::Vacuum => {
             let store = Store::open(&db)?;
             let before = store.stats(&db)?.bytes;
