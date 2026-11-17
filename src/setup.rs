@@ -181,9 +181,33 @@ fn download_embed_server(cfg: &Config, bin: &Option<PathBuf>, model: &Option<Pat
     Ok(())
 }
 
+fn embed_port(url: &str) -> &str {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).unwrap_or(url);
+    let host_port = rest.split('/').next().unwrap_or("");
+    host_port.rsplit_once(':').map(|(_, p)| p).filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())).unwrap_or("8767")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn launchctl_load(path: &std::path::Path) -> anyhow::Result<()> {
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let out = std::process::Command::new("launchctl").args(["load", "-w"]).arg(path).output().context("running launchctl")?;
+    if !out.status.success() {
+        bail!("launchctl load {} failed: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 fn setup_embed_server(apply: bool) -> anyhow::Result<()> {
     let cfg = Config::load(&[])?;
-    let port = cfg.embed.url.rsplit_once(':').and_then(|(_, r)| r.split('/').next()).unwrap_or("8767").to_string();
+    let port = embed_port(&cfg.embed.url);
     let (mut bin, mut model) = find_embed_server(&cfg);
     if apply && (bin.is_none() || model.is_none()) {
         download_embed_server(&cfg, &bin, &model)?;
@@ -191,31 +215,50 @@ fn setup_embed_server(apply: bool) -> anyhow::Result<()> {
     }
     let (Some(bin), Some(model)) = (bin, model) else {
         let dir = config::data_dir();
+        let sum = if cfg!(target_os = "macos") { "shasum -a 256 -c -" } else { "sha256sum -c -" };
         println!(
             "# embed-server: needs llama-server (llama.cpp) and a GGUF embedding model; not found in PATH or {dir}.\n\
              # With --apply ilji downloads both (Linux x86-64, Vulkan) and checks their SHA-256. By hand:\n\
              mkdir -p {dir}/llama {dir}/models\n\
              curl -L -o /tmp/llama.tgz {LLAMA_URL}\n\
-             echo '{LLAMA_SHA256}  /tmp/llama.tgz' | sha256sum -c - && tar -xzf /tmp/llama.tgz -C {dir}/llama\n\
+             echo '{LLAMA_SHA256}  /tmp/llama.tgz' | {sum} && tar -xzf /tmp/llama.tgz -C {dir}/llama\n\
              curl -L -o {dir}/models/{MODEL_FILE} {MODEL_URL}\n\
-             echo '{MODEL_SHA256}  {dir}/models/{MODEL_FILE}' | sha256sum -c -\n\
+             echo '{MODEL_SHA256}  {dir}/models/{MODEL_FILE}' | {sum}\n\
              # macOS: brew install llama.cpp, then download the model as above.\n",
             dir = dir.display(),
         );
         return Ok(());
     };
-    let args = format!(
-        "-m {} --embedding --pooling last --host 127.0.0.1 --port {port} -c 8192 -b 8192 -ub 8192 -np 4 -fa on -ngl 999",
-        model.display()
-    );
+    let argv: Vec<String> = [
+        bin.display().to_string(),
+        "-m".into(),
+        model.display().to_string(),
+        "--embedding".into(),
+        "--pooling".into(),
+        "last".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "-c".into(),
+        "8192".into(),
+        "-b".into(),
+        "8192".into(),
+        "-ub".into(),
+        "8192".into(),
+        "-np".into(),
+        "4".into(),
+        "-fa".into(),
+        "on".into(),
+        "-ngl".into(),
+        "999".into(),
+    ]
+    .into();
     println!("# One embedding server for every agent; a second one on a shared iGPU can exhaust its memory.");
-    println!("{} {args}\n", bin.display());
+    println!("{}\n", shell_join(&argv));
     if cfg!(target_os = "macos") {
         let path = config::home().join("Library/LaunchAgents/io.github.ilji.embed.plist");
-        let items: String = std::iter::once(bin.display().to_string())
-            .chain(args.split(' ').map(str::to_string))
-            .map(|a| format!("<string>{a}</string>"))
-            .collect();
+        let items: String = argv.iter().map(|a| format!("<string>{}</string>", xml_escape(a))).collect();
         let plist = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>io.github.ilji.embed</string><key>ProgramArguments</key><array>{items}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Background</string></dict></plist>\n"
         );
@@ -226,15 +269,15 @@ fn setup_embed_server(apply: bool) -> anyhow::Result<()> {
             if embed::reachable(&cfg.embed) {
                 println!("wrote {} but did not load it: something already answers at {}\n", path.display(), cfg.embed.url);
             } else {
-                std::process::Command::new("launchctl").args(["load", "-w"]).arg(&path).status()?;
+                launchctl_load(&path)?;
                 println!("loaded {}\n", path.display());
             }
         }
     } else {
         let path = config::home().join(".config/systemd/user/ilji-embed.service");
         let unit = format!(
-            "[Unit]\nDescription=ilji: embedding server (llama.cpp)\n\n[Service]\nExecStart={} {args}\nRestart=on-failure\nRestartSec=30\nNice=5\n\n[Install]\nWantedBy=default.target\n",
-            bin.display()
+            "[Unit]\nDescription=ilji: embedding server (llama.cpp)\n\n[Service]\nExecStart={}\nRestart=on-failure\nRestartSec=30\nNice=5\n\n[Install]\nWantedBy=default.target\n",
+            shell_join(&argv)
         );
         println!("# systemd user unit ({})\n{unit}", path.display());
         if apply {
@@ -267,6 +310,7 @@ fn setup_embed_server(apply: bool) -> anyhow::Result<()> {
 fn setup_service(exe: &str, apply: bool) -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let path = config::home().join("Library/LaunchAgents/io.github.ilji.watch.plist");
+        let exe = xml_escape(exe);
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -282,13 +326,14 @@ fn setup_service(exe: &str, apply: bool) -> anyhow::Result<()> {
         if apply {
             std::fs::create_dir_all(path.parent().unwrap())?;
             std::fs::write(&path, plist)?;
-            std::process::Command::new("launchctl").args(["load", "-w"]).arg(&path).status()?;
+            launchctl_load(&path)?;
             println!("loaded {}", path.display());
         }
     } else {
         let path = config::home().join(".config/systemd/user/ilji-watch.service");
         let unit = format!(
-            "[Unit]\nDescription=ilji: keep the index of agent sessions fresh\n\n[Service]\nExecStart={exe} watch\nRestart=on-failure\nRestartSec=30\nNice=10\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=ilji: keep the index of agent sessions fresh\n\n[Service]\nExecStart={} watch\nRestart=on-failure\nRestartSec=30\nNice=10\n\n[Install]\nWantedBy=default.target\n",
+            shell_join(&[exe.to_string()])
         );
         println!("# systemd user unit ({})\n{unit}", path.display());
         if apply {
@@ -327,5 +372,19 @@ mod tests {
     fn shell_join_quotes_what_needs_it() {
         let v = ["a".to_string(), "b c".to_string(), "it's".to_string()];
         assert_eq!(shell_join(&v), r"a 'b c' 'it'\''s'");
+    }
+
+    #[test]
+    fn embed_port_extracts_digits_or_falls_back() {
+        assert_eq!(embed_port("http://127.0.0.1:8767/v1/embeddings"), "8767");
+        assert_eq!(embed_port("http://localhost:9000/v1/embeddings"), "9000");
+        assert_eq!(embed_port("http://localhost/v1/embeddings"), "8767");
+        assert_eq!(embed_port("http://[::1]:8080/v1/embeddings"), "8080");
+        assert_eq!(embed_port("http://[::1]/v1/embeddings"), "8767");
+    }
+
+    #[test]
+    fn xml_escape_escapes_special_chars() {
+        assert_eq!(xml_escape("/a&b/<c>"), "/a&amp;b/&lt;c&gt;");
     }
 }
