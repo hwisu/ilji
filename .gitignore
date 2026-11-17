@@ -1,0 +1,13 @@
+/target
+
+# Local data never goes into the repository: indexes, source logs, eval runs, fixtures copied from a machine.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.jsonl.zst
+/local/
+/eval/out/
+/tests/fixtures/
+.env
