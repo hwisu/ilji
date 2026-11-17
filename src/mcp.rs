@@ -168,7 +168,7 @@ pub struct FullServer {
 
 #[tool_router]
 impl FullServer {
-    /// Search past sessions by keywords (Korean particles are handled). Returns sessions with snippets.
+    /// Search past sessions by meaning and keywords (Korean and English, either way). Returns sessions with snippets.
     #[tool(annotations(read_only_hint = true))]
     async fn search(&self, Parameters(a): Parameters<SearchArgs>) -> Result<CallToolResult, McpError> {
         let core = self.core.clone();

@@ -42,6 +42,40 @@ pub enum Fusion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// BM25 only.
+    Keyword,
+    /// Embeddings only (dialog chunks).
+    Semantic,
+    /// Both, merged as `search.hybrid` says. Falls back to keyword when no embedding is reachable.
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Hybrid {
+    /// Reciprocal rank fusion of the keyword and embedding rankings.
+    Rrf,
+    /// Tool chunks keep their keyword ranks; only the dialog positions are re-ranked by RRF.
+    /// Embeddings cover dialog only, so this keeps tool-output search as strong as keyword search.
+    Slots,
+    /// RRF where a tool chunk's keyword term is scaled to what a chunk found by both lanes reaches.
+    Balanced,
+    /// Route by the query: identifiers or a short keyword list go to keyword search (no embedding
+    /// call); a sentence-like question goes to rrf.
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Precision {
+    /// One byte per dimension with a per-vector scale (a quarter of f32).
+    I8,
+    F32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Tools {
     /// search, open, recent, files, fix as separate MCP tools.
     Full,
@@ -133,6 +167,15 @@ pub struct SearchCfg {
     pub rrf_k: f64,
     pub dialog_weight: f64,
     pub tool_weight: f64,
+    pub mode: Mode,
+    pub hybrid: Hybrid,
+    /// Weights of the keyword and embedding rankings in hybrid fusion.
+    pub keyword_weight: f64,
+    pub dense_weight: f64,
+    /// Embedding candidates considered per query.
+    pub dense_k: usize,
+    /// Multiplier on a tool chunk's keyword term in hybrid rrf (the embedding lane never returns tool chunks).
+    pub tool_boost: f64,
 }
 
 impl Default for SearchCfg {
@@ -151,6 +194,57 @@ impl Default for SearchCfg {
             rrf_k: 60.0,
             dialog_weight: 1.0,
             tool_weight: 1.0,
+            mode: Mode::Hybrid,
+            hybrid: Hybrid::Auto,
+            keyword_weight: 1.0,
+            dense_weight: 1.0,
+            dense_k: 100,
+            tool_boost: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbedCfg {
+    /// Embed dialog chunks and use them in search. Off = keyword only, no embedding server needed.
+    pub enabled: bool,
+    /// Embed new chunks at the end of `index` and each `watch` pass.
+    pub auto: bool,
+    /// An OpenAI-compatible embeddings endpoint (llama-server, Ollama, LM Studio, ...).
+    pub url: String,
+    /// Model name sent to the endpoint; vectors are stored per model.
+    pub model: String,
+    /// Text put before every query and every passage (instruction-tuned models need one).
+    pub query_prefix: String,
+    pub passage_prefix: String,
+    pub precision: Precision,
+    /// Texts per request and characters per text.
+    pub batch: usize,
+    pub max_chars: usize,
+    pub timeout_secs: u64,
+    /// Leave out tool transcripts that Codex stores inside imported assistant messages
+    /// ([external_agent_tool_call] blocks); they stay in the keyword index.
+    pub skip_imported_tools: bool,
+    /// A chunk with fewer characters left than this is not embedded.
+    pub min_chars: usize,
+}
+
+impl Default for EmbedCfg {
+    fn default() -> Self {
+        EmbedCfg {
+            enabled: true,
+            auto: true,
+            url: "http://127.0.0.1:8767/v1/embeddings".into(),
+            model: "harrier-oss-v1-0.6b".into(),
+            query_prefix: "Instruct: Given a question about earlier coding work, retrieve the conversation passages that answer it\nQuery: ".into(),
+            passage_prefix: String::new(),
+            precision: Precision::I8,
+            batch: 32,
+            max_chars: 2048,
+            timeout_secs: 120,
+            skip_imported_tools: true,
+            min_chars: 20,
         }
     }
 }
@@ -187,6 +281,7 @@ pub struct Config {
     pub sources: Sources,
     pub index: IndexCfg,
     pub search: SearchCfg,
+    pub embed: EmbedCfg,
     pub serve: ServeCfg,
     pub encrypt: EncryptCfg,
 }

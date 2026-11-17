@@ -4,6 +4,7 @@ mod chunk;
 mod collect;
 mod common;
 mod config;
+mod embed;
 mod ingest;
 mod mcp;
 mod model;
@@ -52,7 +53,19 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
-    /// Keyword search.
+    /// Embed dialog chunks that have no vector yet (needs an embedding endpoint, see embed.url).
+    Embed {
+        /// Stop after this many chunks.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only count what is pending.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete the vectors stored under this model key (see `ilji stats`) and stop.
+        #[arg(long, value_name = "KEY")]
+        drop: Option<String>,
+    },
+    /// Search: keyword, semantic or hybrid (search.mode).
     Search(SearchCli),
     /// Show a chunk, an event (e<id>) or a session with the turns around it.
     Open {
@@ -132,7 +145,7 @@ enum Cmd {
     /// Show how to connect an agent (claude, codex, opencode, pi) or run `watch` as a service.
     /// With --apply, registers through the agent's own CLI (claude, pi) or installs the service.
     Setup {
-        /// claude | codex | opencode | pi | service (all agents when omitted)
+        /// claude | codex | opencode | pi | service | embed-server (all agents when omitted)
         target: Option<String>,
         #[arg(long)]
         apply: bool,
@@ -178,6 +191,9 @@ struct SearchCli {
     /// Match Korean words exactly instead of as prefixes.
     #[arg(long)]
     no_prefix: bool,
+    /// keyword, semantic or hybrid (default from search.mode).
+    #[arg(long, value_enum)]
+    mode: Option<ModeArg>,
     #[arg(long)]
     json: bool,
 }
@@ -186,6 +202,13 @@ struct SearchCli {
 enum GroupArg {
     Session,
     Chunk,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    Keyword,
+    Semantic,
+    Hybrid,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -243,6 +266,7 @@ fn run() -> anyhow::Result<()> {
                 }
             })?;
             print_report(&r);
+            auto_embed(&store, &cfg, quiet);
         }
         Cmd::Watch { interval } => {
             let mut store = Store::open(&db)?;
@@ -252,8 +276,32 @@ fn run() -> anyhow::Result<()> {
                 if written > 0 || r.pruned > 0 || !r.errors.is_empty() {
                     print_report(&r);
                 }
+                auto_embed(&store, &cfg, true);
                 std::thread::sleep(std::time::Duration::from_secs(interval.max(5)));
             }
+        }
+        Cmd::Embed { limit, dry_run, drop } => {
+            let store = Store::open(&db)?;
+            if let Some(k) = drop {
+                let n = store.conn.execute("DELETE FROM vectors WHERE model=?1", [&k])?;
+                println!("dropped {n} vectors of {k}");
+                return Ok(());
+            }
+            let pending = embed::pending(&store, &cfg)?;
+            let chars: usize = pending.iter().filter_map(|(_, t)| embed::passage_text(&cfg.embed, t)).map(|t| t.chars().count()).sum();
+            println!("{} dialog chunks to embed with {} ({:.1}M characters)", pending.len(), cfg.embed.model, chars as f64 / 1e6);
+            if dry_run || pending.is_empty() {
+                return Ok(());
+            }
+            if !embed::reachable(&cfg.embed) {
+                bail!("no embedding endpoint at {}; start one (`ilji setup embed-server`) or set embed.url", cfg.embed.url);
+            }
+            let r = embed::backfill(&store, &cfg, limit, |done, total, cps| {
+                let eta = if cps > 0.0 { (chars as f64 * (1.0 - done as f64 / total as f64)) / cps } else { 0.0 };
+                eprint!("\r{done}/{total} · {:.0} chars/s · ~{:.0} s left   ", cps, eta);
+            })?;
+            eprintln!();
+            println!("embedded {} chunks in {:.0} s", r.done, r.secs);
         }
         Cmd::Search(a) => {
             if let Some(v) = a.snippet {
@@ -267,6 +315,13 @@ fn run() -> anyhow::Result<()> {
             }
             if a.no_prefix {
                 cfg.search.korean_prefix = false;
+            }
+            if let Some(m) = a.mode {
+                cfg.search.mode = match m {
+                    ModeArg::Keyword => config::Mode::Keyword,
+                    ModeArg::Semantic => config::Mode::Semantic,
+                    ModeArg::Hybrid => config::Mode::Hybrid,
+                };
             }
             cfg.validate()?;
             let store = Store::open_ro(&db)?;
@@ -425,6 +480,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Vacuum => {
             let store = Store::open(&db)?;
             let before = store.stats(&db)?.bytes;
+            println!("dropped {} unused vectors", store.prune_vectors()?);
             store.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
             let after = store.stats(&db)?.bytes;
             println!("{:.1} MB → {:.1} MB", before as f64 / 1e6, after as f64 / 1e6);
@@ -468,11 +524,117 @@ fn setup(target: Option<&str>, apply: bool, tools: Option<ToolsArg>) -> anyhow::
                 serde_json::to_string(&[vec![exe.clone()], serve.clone()].concat())?
             ),
             ("service", None) => setup_service(&exe, apply)?,
-            (other, None) => bail!("unknown target {other:?}; use claude, codex, opencode, pi or service"),
+            ("embed-server", None) => setup_embed_server(apply)?,
+            (other, None) => bail!("unknown target {other:?}; use claude, codex, opencode, pi, service or embed-server"),
         }
     }
     if apply && target.is_none() {
         println!("codex and opencode have no registration CLI; add the snippets above by hand.");
+    }
+    Ok(())
+}
+
+/// Embed new chunks after an ingest when embeddings are on and the endpoint answers.
+fn auto_embed(store: &Store, cfg: &Config, quiet: bool) {
+    if !cfg.embed.enabled || !cfg.embed.auto {
+        return;
+    }
+    match embed::pending(store, cfg) {
+        Ok(p) if p.is_empty() => {}
+        Ok(p) => {
+            if !embed::reachable(&cfg.embed) {
+                if !quiet {
+                    eprintln!("{} chunks wait for embeddings; no endpoint at {} (keyword search still works)", p.len(), cfg.embed.url);
+                }
+                return;
+            }
+            match embed::backfill(store, cfg, None, |_, _, _| {}) {
+                Ok(r) => println!("embedded {} chunks in {:.0} s", r.done, r.secs),
+                Err(e) => eprintln!("embedding stopped: {e:#}"),
+            }
+        }
+        Err(e) => eprintln!("embedding check failed: {e:#}"),
+    }
+}
+
+/// Where a llama-server and a GGUF model are, if anywhere obvious.
+fn find_embed_server(cfg: &Config) -> (Option<PathBuf>, Option<PathBuf>) {
+    let on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).map(|d| d.join("llama-server")).find(|p| p.is_file()))
+        .unwrap_or(None);
+    let local = |sub: &str, pred: &dyn Fn(&std::path::Path) -> bool| {
+        walkdir::WalkDir::new(config::data_dir().join(sub))
+            .max_depth(3)
+            .into_iter()
+            .flatten()
+            .map(|e| e.into_path())
+            .find(|p| p.is_file() && pred(p))
+    };
+    let bin = on_path.or_else(|| local("llama", &|p| p.file_name().is_some_and(|n| n == "llama-server")));
+    let model = local("models", &|p| {
+        let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        n.ends_with(".gguf") && n.starts_with(&cfg.embed.model)
+    });
+    (bin, model)
+}
+
+fn setup_embed_server(apply: bool) -> anyhow::Result<()> {
+    let cfg = Config::load(&[])?;
+    let port = cfg.embed.url.rsplit_once(':').and_then(|(_, r)| r.split('/').next()).unwrap_or("8767").to_string();
+    let (bin, model) = find_embed_server(&cfg);
+    let (Some(bin), Some(model)) = (bin, model) else {
+        let dir = config::data_dir();
+        println!(
+            "# Needs llama-server (llama.cpp) and a GGUF embedding model; neither was found in PATH or {dir}.\n\
+             # Linux x86-64 with Vulkan (AMD/Intel/NVIDIA iGPU or GPU):\n\
+             mkdir -p {d}/llama {d}/models\n\
+             curl -L -o /tmp/llama.tgz https://github.com/ggml-org/llama.cpp/releases/download/b12065/llama-b12065-bin-ubuntu-vulkan-x64.tar.gz\n\
+             echo '007c2c6f545576f9f8c95d6041a243d6ab8135528a4448e9856591d2cbbac5b0  /tmp/llama.tgz' | sha256sum -c - && tar -xzf /tmp/llama.tgz -C {d}/llama\n\
+             curl -L -o {d}/models/harrier-oss-v1-0.6b.Q8_0.gguf https://huggingface.co/mradermacher/harrier-oss-v1-0.6b-GGUF/resolve/main/harrier-oss-v1-0.6b.Q8_0.gguf\n\
+             echo 'ba2c9408f82cfdb73aaf70aaea9f125f3fb24c5e76ce0efb469e1530e5ec53e4  {d}/models/harrier-oss-v1-0.6b.Q8_0.gguf' | sha256sum -c -\n\
+             # macOS: brew install llama.cpp, then download the model as above.\n\
+             # Then run `ilji setup embed-server` again.",
+            dir = dir.display(),
+            d = dir.display()
+        );
+        return Ok(());
+    };
+    let args = format!(
+        "-m {} --embedding --pooling last --host 127.0.0.1 --port {port} -c 8192 -b 8192 -ub 8192 -np 4 -fa on -ngl 999",
+        model.display()
+    );
+    println!("# One embedding server for every agent; a second one on a shared iGPU can exhaust its memory.");
+    println!("{} {args}\n", bin.display());
+    if cfg!(target_os = "macos") {
+        let path = config::home().join("Library/LaunchAgents/io.github.ilji.embed.plist");
+        let items: String = std::iter::once(bin.display().to_string())
+            .chain(args.split(' ').map(str::to_string))
+            .map(|a| format!("<string>{a}</string>"))
+            .collect();
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>io.github.ilji.embed</string><key>ProgramArguments</key><array>{items}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Background</string></dict></plist>\n"
+        );
+        println!("# launchd agent ({})\n{plist}", path.display());
+        if apply {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, plist)?;
+            std::process::Command::new("launchctl").args(["load", "-w"]).arg(&path).status()?;
+            println!("loaded {}", path.display());
+        }
+    } else {
+        let path = config::home().join(".config/systemd/user/ilji-embed.service");
+        let unit = format!(
+            "[Unit]\nDescription=ilji: embedding server (llama.cpp)\n\n[Service]\nExecStart={} {args}\nRestart=on-failure\nRestartSec=30\nNice=5\n\n[Install]\nWantedBy=default.target\n",
+            bin.display()
+        );
+        println!("# systemd user unit ({})\n{unit}", path.display());
+        if apply {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(&path, unit)?;
+            std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()?;
+            std::process::Command::new("systemctl").args(["--user", "enable", "--now", "ilji-embed.service"]).status()?;
+            println!("enabled ilji-embed.service");
+        }
     }
     Ok(())
 }

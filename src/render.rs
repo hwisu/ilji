@@ -10,6 +10,9 @@ pub fn results(r: &Results, group: Group, max_chars: usize) -> String {
         Group::Session => format!("{hits} hits for '{}' in {} sessions ({} matched)\n", r.query, r.sessions.len(), r.matched),
         Group::Chunk => format!("{hits} hits for '{}'\n", r.query),
     };
+    if let Some(n) = &r.note {
+        out += &format!("note: {n}\n");
+    }
     if r.sessions.is_empty() {
         return out + "\nNo hits. Try other words, a cue from the work (file, error, PR), or include_recent.\n";
     }
@@ -96,6 +99,10 @@ pub fn stats(s: &Stats, db: &std::path::Path) -> String {
     }
     if s.forgotten > 0 {
         out += &format!("forgotten sessions: {}\n", s.forgotten);
+    }
+    for (model, n, covered) in &s.vectors {
+        let pct = if s.dialog_chunks > 0 { 100.0 * *covered as f64 / s.dialog_chunks as f64 } else { 0.0 };
+        out += &format!("vectors {model}: {n} ({pct:.0}% of {} dialog chunks)\n", s.dialog_chunks);
     }
     out
 }

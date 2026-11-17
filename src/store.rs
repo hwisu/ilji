@@ -11,7 +11,17 @@ use crate::chunk::{Body, chunk_events, char_slice, tool_text};
 use crate::config::IndexCfg;
 use crate::model::Session;
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
+
+/// FNV-1a 64-bit: stable across builds, used to key vectors by chunk text.
+pub fn text_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -26,8 +36,13 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE INDEX IF NOT EXISTS events_session ON events(session_id, seq);
 CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, event_first INTEGER, event_last INTEGER,
-  ts REAL, kind TEXT, text TEXT, span_start INTEGER, span_len INTEGER);
+  ts REAL, kind TEXT, text TEXT, span_start INTEGER, span_len INTEGER, hash TEXT);
 CREATE INDEX IF NOT EXISTS chunks_session ON chunks(session_id);
+CREATE INDEX IF NOT EXISTS chunks_hash ON chunks(hash);
+-- Embeddings keyed by chunk text, so a re-read session with unchanged text is not embedded again.
+CREATE TABLE IF NOT EXISTS vectors(
+  model TEXT NOT NULL, hash TEXT NOT NULL, dim INTEGER NOT NULL, scale REAL NOT NULL, data BLOB NOT NULL,
+  PRIMARY KEY(model, hash)) WITHOUT ROWID;
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   body, title, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2');
 CREATE TABLE IF NOT EXISTS forgotten(id TEXT PRIMARY KEY, at REAL);
@@ -45,6 +60,9 @@ pub struct Stats {
     pub last: f64,
     pub bytes: u64,
     pub forgotten: i64,
+    /// (model, vectors, dialog chunks with a vector for that model)
+    pub vectors: Vec<(String, i64, i64)>,
+    pub dialog_chunks: i64,
 }
 
 impl Store {
@@ -150,8 +168,8 @@ impl Store {
         let chunks = chunk_events(&s.events, cfg);
         {
             let mut ins_chunk = tx.prepare_cached(
-                "INSERT INTO chunks(session_id, event_first, event_last, ts, kind, text, span_start, span_len)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO chunks(session_id, event_first, event_last, ts, kind, text, span_start, span_len, hash)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             let mut ins_fts = tx.prepare_cached("INSERT INTO chunks_fts(rowid, body, title) VALUES(?1, ?2, ?3)")?;
             let mut cached: Option<(usize, String)> = None;
@@ -159,7 +177,7 @@ impl Store {
                 let (first, last) = (event_ids[c.first], event_ids[c.last]);
                 match &c.body {
                     Body::Dialog(text) => {
-                        ins_chunk.execute(params![s.id, first, last, c.ts, "dialog", text, None::<i64>, None::<i64>])?;
+                        ins_chunk.execute(params![s.id, first, last, c.ts, "dialog", text, None::<i64>, None::<i64>, text_hash(text)])?;
                         ins_fts.execute(params![tx.last_insert_rowid(), text, s.title])?;
                     }
                     Body::Tool { start, len } => {
@@ -168,7 +186,7 @@ impl Store {
                             cached = Some((c.first, tool_text(&e.tool, &e.text, &e.output)));
                         }
                         let body = char_slice(&cached.as_ref().unwrap().1, *start, *len);
-                        ins_chunk.execute(params![s.id, first, last, c.ts, "tool", None::<String>, *start as i64, *len as i64])?;
+                        ins_chunk.execute(params![s.id, first, last, c.ts, "tool", None::<String>, *start as i64, *len as i64, None::<String>])?;
                         ins_fts.execute(params![tx.last_insert_rowid(), body, s.title])?;
                     }
                 }
@@ -188,6 +206,13 @@ impl Store {
             self.delete_session(id)?;
         }
         Ok(ids.len())
+    }
+
+    /// Drop vectors no chunk refers to any more. Returns how many went.
+    pub fn prune_vectors(&self) -> anyhow::Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM vectors WHERE hash NOT IN (SELECT hash FROM chunks WHERE hash IS NOT NULL)", [])?)
     }
 
     /// Sessions whose id, cwd or repo contains one of `patterns`.
@@ -219,6 +244,14 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         st.forgotten = self.conn.query_row("SELECT count(*) FROM forgotten", [], |r| r.get(0))?;
+        st.dialog_chunks =
+            self.conn.query_row("SELECT count(DISTINCT hash) FROM chunks WHERE kind='dialog'", [], |r| r.get(0))?;
+        let mut q = self.conn.prepare(
+            "SELECT v.model, count(*), (SELECT count(DISTINCT c.hash) FROM chunks c JOIN vectors w
+                                        ON w.hash = c.hash AND w.model = v.model WHERE c.kind = 'dialog')
+             FROM vectors v GROUP BY v.model",
+        )?;
+        st.vectors = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.flatten().collect();
         for suffix in ["", "-wal"] {
             let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
             st.bytes += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);

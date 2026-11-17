@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::chunk::{char_slice, tool_text};
-use crate::config::{Config, Fusion, Group, now};
+use crate::config::{Config, Fusion, Group, Hybrid, Mode, now};
 use crate::store::Store;
 use crate::tokenize::{KoreanOpts, fts_query, query_terms, words};
 
@@ -77,18 +77,189 @@ pub struct SessionHits {
 #[derive(Debug, Clone, Serialize)]
 pub struct Results {
     pub query: String,
+    /// keyword, semantic or hybrid: what actually ran.
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub matched: usize,
     pub sessions: Vec<SessionHits>,
 }
 
-/// Run a keyword search. Chunk mode returns one session entry per hit, so rendering stays uniform.
+/// Search by `search.mode`. Chunk mode returns one session entry per hit, so rendering stays uniform.
 pub fn search(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Results> {
+    let s = &cfg.search;
+    let lexical = s.mode == Mode::Hybrid && s.hybrid == Hybrid::Auto && is_lexical(&q.text);
+    let want_dense = cfg.embed.enabled
+        && s.mode != Mode::Keyword
+        && !lexical
+        && q.raw_match.is_none()
+        && q.kind.as_deref() != Some("tool");
+    let mut note = None;
+    let dense = if want_dense {
+        match dense_lane(store, cfg, q) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                note = Some(format!("embeddings unavailable ({e:#}); keyword results only"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let keyword = if s.mode == Mode::Semantic && dense.is_some() { vec![] } else { keyword_lane(store, cfg, q)? };
+    if keyword.is_empty() && dense.is_none() && q.raw_match.is_none() && fts_query(&q.text, q.ko).is_empty() {
+        anyhow::bail!("the query has no searchable words");
+    }
+    let (ranked, mode) = match dense {
+        None if lexical => (keyword, "hybrid:keyword"),
+        None => (keyword, "keyword"),
+        Some(d) if s.mode == Mode::Semantic => (d, "semantic"),
+        Some(d) => (
+            match s.hybrid {
+                Hybrid::Rrf | Hybrid::Auto => rrf(keyword, d, s, false),
+                Hybrid::Balanced => rrf(keyword, d, s, true),
+                Hybrid::Slots => slots(keyword, d, s),
+            },
+            "hybrid",
+        ),
+    };
+    let mut r = finish(store, cfg, q, ranked)?;
+    r.note = note;
+    r.mode = mode.to_string();
+    Ok(r)
+}
+
+/// Whether a query reads like a lookup rather than a question: it names an identifier (a path,
+/// snake_case, a dotted or numbered token, CamelCase, something quoted) or is a few words without
+/// a question mark. Such queries are served best by keyword search alone.
+pub fn is_lexical(text: &str) -> bool {
+    let t = text.trim();
+    if t.contains('`') || t.contains('"') {
+        return true;
+    }
+    let words: Vec<&str> = t.split_whitespace().collect();
+    let ident = |w: &str| {
+        // Sentence punctuation around a word is not part of it; a dot or colon inside one is.
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '/' | '_' | '#'));
+        let ascii = w.is_ascii() && w.chars().any(|c| c.is_ascii_alphabetic());
+        ascii
+            && (w.contains(['_', '/', '.', ':', '#', '='])
+                || (w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(|c| c.is_ascii_alphabetic()))
+                || (w.chars().skip(1).any(|c| c.is_ascii_uppercase()) && w.chars().any(|c| c.is_ascii_lowercase())))
+    };
+    words.iter().any(|w| ident(w)) || (words.len() <= 5 && !t.ends_with('?'))
+}
+
+/// Reciprocal rank fusion. With `balance_tools`, a tool chunk (which the embedding lane cannot
+/// return) has its keyword term scaled up to what a chunk found by both lanes can reach.
+fn rrf(keyword: Vec<Hit>, dense: Vec<Hit>, s: &crate::config::SearchCfg, balance_tools: bool) -> Vec<Hit> {
+    let boost = (s.keyword_weight + s.dense_weight) / s.keyword_weight.max(1e-9);
+    let mut fused: HashMap<i64, (f64, Hit)> = HashMap::new();
+    for (rank, h) in keyword.into_iter().enumerate() {
+        let w = match (h.kind == "tool", balance_tools) {
+            (true, true) => s.keyword_weight * boost,
+            (true, false) => s.keyword_weight * s.tool_boost,
+            _ => s.keyword_weight,
+        };
+        fused.entry(h.chunk).or_insert((0.0, h)).0 += w / (s.rrf_k + rank as f64 + 1.0);
+    }
+    for (rank, h) in dense.into_iter().enumerate() {
+        fused.entry(h.chunk).or_insert((0.0, h)).0 += s.dense_weight / (s.rrf_k + rank as f64 + 1.0);
+    }
+    let mut v: Vec<(f64, Hit)> = fused.into_values().collect();
+    v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    v.into_iter()
+        .map(|(score, mut h)| {
+            h.score = score * 100.0;
+            h
+        })
+        .collect()
+}
+
+/// Tool chunks keep their keyword positions; the dialog positions are refilled from the fusion of
+/// keyword dialog hits and embedding hits.
+fn slots(keyword: Vec<Hit>, dense: Vec<Hit>, s: &crate::config::SearchCfg) -> Vec<Hit> {
+    let dialog: Vec<Hit> = keyword.iter().filter(|h| h.kind != "tool").cloned().collect();
+    let mut fused = rrf(dialog, dense, s, false).into_iter();
+    let mut out = Vec::with_capacity(keyword.len());
+    for h in keyword {
+        if h.kind == "tool" {
+            out.push(h);
+        } else if let Some(d) = fused.next() {
+            out.push(d);
+        }
+    }
+    out.extend(fused);
+    out
+}
+
+/// Embedding lane: the nearest dialog chunks that pass the query's filters, most similar first.
+fn dense_lane(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Vec<Hit>> {
+    let vecs = crate::embed::cached(store, &crate::embed::key(&cfg.embed))?;
+    anyhow::ensure!(vecs.len() > 0, "no vectors for {} yet; run `ilji embed`", cfg.embed.model);
+    let qv = crate::embed::query_vector(cfg, &q.text)?;
+    let top = vecs.top(&qv, cfg.search.dense_k.max(q.k));
+    if top.is_empty() {
+        return Ok(vec![]);
+    }
+    let rank: HashMap<&str, (usize, f32)> =
+        top.iter().enumerate().map(|(r, (i, s))| (vecs.hashes[*i].as_str(), (r, *s))).collect();
+    let n = top.len();
+    let marks = (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT c.id, c.session_id, s.source, coalesce(s.title,''), coalesce(s.repo,''), c.ts, c.kind,
+                coalesce(c.text,''), c.event_first, c.hash
+         FROM chunks c JOIN sessions s ON s.id = c.session_id
+         WHERE c.hash IN ({marks}) AND c.kind = 'dialog'
+           AND (?{a} IS NULL OR s.source = ?{a})
+           AND (?{b} IS NULL OR instr(s.repo, ?{b}) > 0 OR instr(s.cwd, ?{b}) > 0)
+           AND c.ts < ?{c} AND c.ts >= ?{d}",
+        a = n + 1,
+        b = n + 2,
+        c = n + 3,
+        d = n + 4,
+    );
+    use rusqlite::types::Value as V;
+    let until = if q.include_recent { f64::MAX } else { now() - cfg.search.recent_secs };
+    let mut values: Vec<V> = top.iter().map(|(i, _)| V::Text(vecs.hashes[*i].clone())).collect();
+    values.push(q.source.clone().map_or(V::Null, V::Text));
+    values.push(q.repo.clone().map_or(V::Null, V::Text));
+    values.push(V::Real(until));
+    values.push(V::Real(q.since.unwrap_or(0.0)));
+    let mut st = store.conn.prepare(&sql)?;
+    let mut hits: Vec<(usize, Hit)> = st
+        .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+            let hash: String = r.get(9)?;
+            let (rk, sim) = rank.get(hash.as_str()).copied().unwrap_or((usize::MAX, 0.0));
+            Ok((
+                rk,
+                Hit {
+                    chunk: r.get(0)?,
+                    session: r.get(1)?,
+                    source: r.get(2)?,
+                    title: r.get(3)?,
+                    repo: r.get(4)?,
+                    ts: r.get(5)?,
+                    kind: r.get(6)?,
+                    event: r.get(8)?,
+                    score: sim as f64,
+                    text: r.get(7)?,
+                    snippet: String::new(),
+                },
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    hits.sort_by_key(|(rk, h)| (*rk, h.chunk));
+    Ok(hits.into_iter().map(|(_, h)| h).collect())
+}
+
+fn keyword_lane(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Vec<Hit>> {
     let expr = match &q.raw_match {
         Some(m) => m.clone(),
         None => fts_query(&q.text, q.ko),
     };
     if expr.is_empty() {
-        anyhow::bail!("the query has no searchable words");
+        return Ok(vec![]);
     }
     let s = &cfg.search;
     let expr = if s.title_weight > 0.0 { expr } else { format!("body : ({expr})") };
@@ -116,7 +287,7 @@ pub fn search(store: &Store, cfg: &Config, q: &Query) -> anyhow::Result<Results>
             ranked.push(hit);
         }
     }
-    finish(store, cfg, q, ranked)
+    Ok(ranked)
 }
 
 fn fetch_lane(store: &Store, cfg: &Config, q: &Query, expr: &str, kind: Option<&str>, n: usize) -> anyhow::Result<Vec<Hit>> {
@@ -235,7 +406,7 @@ fn finish(store: &Store, cfg: &Config, q: &Query, ranked: Vec<Hit>) -> anyhow::R
             }
         })
         .collect();
-    Ok(Results { query: q.text.clone(), matched, sessions })
+    Ok(Results { query: q.text.clone(), mode: String::new(), note: None, matched, sessions })
 }
 
 fn hash(s: &str) -> u64 {
@@ -446,6 +617,18 @@ pub fn fmt_time(ts: f64, date: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_lookups_to_keyword() {
+        assert!(is_lexical("OOMKilled deploy api"));
+        assert!(is_lexical("지난번 src/auth.rs 바꾼 이유가 뭐였지?"));
+        assert!(is_lexical("배포 실패 원인 분석"));
+        assert!(is_lexical("PR #1031 preflight"));
+        assert!(!is_lexical("지난번에 배포가 왜 실패했는지 원인을 알려줄래?"));
+        assert!(!is_lexical("Why did the deployment fail last time, and what did we change?"));
+        assert!(!is_lexical("What did we decide about the read-only replica at that time."));
+        assert!(is_lexical("why does main.rs panic on start"));
+    }
 
     #[test]
     fn snippet_centres_on_the_first_term() {
