@@ -11,3 +11,6 @@
 /eval/out/
 /tests/fixtures/
 .env
+
+# Skill files other agents drop into the directory they run in (Antigravity: skills/system/...).
+/skills/
